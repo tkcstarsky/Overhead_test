@@ -14,6 +14,7 @@ using namespace std;
 #define S (N/1)                     // sparse matrix's nonzero elements per col (75% currently)
 #define BLOCK_SIZE 32               // block size ( 256->16 / 1024->32 )
 #define TEST_TIMES 100             // mul module caculate times (for easy record the running time)
+#define TEST_REPEAT 100
 
 
 // simple cuda mul kernel 
@@ -22,17 +23,13 @@ static void __global__ mul_kernel(int rowsize,int colsize,int colpitch,const flo
     uint index= threadIdx.x + blockIdx.x * blockDim.x;
     if(rowsize <= index) return;
     float temp=0.0f;
-    for(int j=0;j<TEST_TIMES;j++)
+    
+    for(int i=0;i<rowsize;i++)
     {
-        for(int i=0;i<rowsize;i++)
-        {
-            temp+=d_a[i*colpitch+index]*d_b[i+j*N];
-        }
-        d_c[index+j*N]=temp;
-        
-        temp = 0.0f;
-        __syncthreads();
+        temp+=d_a[i*colpitch+index]*d_b[i];
     }
+    d_c[index]=temp;
+    
 }
 
 // cuda mul kernel with shared memory
@@ -41,28 +38,25 @@ static void __global__ mul_kernel_shared(int rowsize,int colsize,int colpitch,co
     __shared__ float s_b[N];
     float temp=0.0f;
     uint index= threadIdx.x + blockIdx.x * blockDim.x;
-    for(int j=0;j<TEST_TIMES;j++)
+    
+    for(int start=0;start<rowsize;start+=sharedsize)
     {
-        for(int start=0;start<rowsize;start+=sharedsize)
-        {
-            // load shared memory (vec)
-            __syncthreads();
-            for(int i=threadIdx.x;i<sharedsize&&(i+start)<rowsize;i+=blockDim.x)
-                s_b[i]=d_b[i+start+j*N];
-            __syncthreads();
-        
-            if(rowsize <= index) continue;
-            int end=start+sharedsize > rowsize ? rowsize : start+sharedsize;
-            for(int i=start;i<end;i++)
-            {
-                temp+=d_a[i*colpitch+index]*s_b[i-start];
-            }
-        }
-        if(index<colsize)
-            d_c[index+j*N]=temp;
-        temp = 0;
+        // load shared memory (vec)
         __syncthreads();
+        for(int i=threadIdx.x;i<sharedsize&&(i+start)<rowsize;i+=blockDim.x)
+            s_b[i]=d_b[i+start];
+        __syncthreads();
+        
+        if(rowsize <= index) continue;
+        int end=start+sharedsize > rowsize ? rowsize : start+sharedsize;
+        for(int i=start;i<end;i++)
+        {
+            temp+=d_a[i*colpitch+index]*s_b[i-start];
+        }
     }
+
+    if(index<colsize)
+        d_c[index]=temp;
 }
 
 
@@ -73,31 +67,30 @@ static void __global__ mul_kernel_shared_csr(int rowsize,int colsize,int colpitc
     float temp=0.0f;
     uint index= threadIdx.x + blockIdx.x * blockDim.x;
 
-    for(int j=0;j<TEST_TIMES;j++)
-    {
-        // load shared memory (vec)
-        for(int start=0;start<rowsize;start+=sharedsize)
-        {
-            for(int i=threadIdx.x;i<sharedsize&&(i+start)<rowsize;i+=blockDim.x)
-            {
-                s_b[i]=d_b[i+start+j*N];
-            }
-            __syncthreads();
-        }
-    
+    if(index>=colsize) return;
 
-        for(int i=0;i<S;i++)
+    // load shared memory (vec)
+    for(int start=0;start<rowsize;start+=sharedsize)
+    {
+        for(int i=threadIdx.x;i<sharedsize&&(i+start)<rowsize;i+=blockDim.x)
         {
-            temp+=d_val[index+N*i]*s_b[d_row[index+i*N]];
+            s_b[i]=d_b[i+start];
         }
-    
-        if(index<colsize)
-            d_c[index+j*N]=temp;
-        temp = 0;
         __syncthreads();
     }
-        
+    
+    for(int i=0;i<S;i++)
+    {
+        temp+=d_val[index+N*i]*s_b[d_row[index+i*N]];
+        //printf("Thread %d: d_row=%d,d_val=%f\n",index,d_val[index+N*i],d_row[index+i*N]);
+    }
+    
+    if(index<colsize)
+        d_c[index]=temp;
+
 }
+        
+
 
 
 // use register cache row data
@@ -110,56 +103,49 @@ static void __global__ mul_kernel_shared_csr_reg(int rowsize,int colsize,int col
 
     uint index= threadIdx.x + blockIdx.x * blockDim.x;
 
+    if(index>=colsize) return;
+
     for(int i=0;i<S;i++)
     {
         val[i]=d_val[index+N*i];
         row[i]=d_row[index+i*N];
     }
 
-    for(int j=0;j<TEST_TIMES;j++)
-    {
 
     // load shared memory (vec)
-        for(int start=0;start<rowsize;start+=sharedsize)
+    for(int start=0;start<rowsize;start+=sharedsize)
+    {
+        for(int i=threadIdx.x;i<sharedsize&&(i+start)<rowsize;i+=blockDim.x)
         {
-            for(int i=threadIdx.x;i<sharedsize&&(i+start)<rowsize;i+=blockDim.x)
-            {
-                s_b[i]=d_b[i+start+j*N];
-            }
-            __syncthreads();
+            s_b[i]=d_b[i+start];
         }
-
-    
-    
-        for(int i=0;i<S;i++)
-        {
-            temp+=val[i]*s_b[row[i]];
-        }
-        
-        if(index<colsize)
-            d_c[index+j*N]=temp;
-        temp = 0;
         __syncthreads();
     }
+
+    for(int i=0;i<S;i++)
+    {
+        temp+=val[i]*s_b[row[i]];
+    }
         
+    if(index<colsize)
+        d_c[index]=temp;
 }
 
 // cpu matrix mul
 void mul_cpu(float *a,float *b,float *c)
 {
-    for(int k=0;k<TEST_TIMES;k++)
-        for(int i=0;i<N;i++)
-        {
-            c[i+k*N]=0;
-            for(int j=0;j<N;j++)
-                c[i+k*N]+=(*(a+i*N+j)**(b+j+k*N));
-        }
+    for(int i=0;i<N;i++)
+    {
+        c[i]=0;
+        for(int j=0;j<N;j++)
+            c[i]+=(*(a+i*N+j)**(b+j));
+    }
 }
 
 // test cpu and gpu mul result
 bool resultcompare(float *ref,float *test,float accu)
 {
-    for(int i=0;i<N*TEST_TIMES;i++)
+    for(int i=0;i<N;i++)
     {
         if(fabs(*(ref+i)-*(test+i))>accu) return false;
     }
@@ -200,6 +186,7 @@ int main()
     bool a_row[N];                          // nozero element flag
     int pos;
     float temp;
+    int rand_temp;
 
     // CPU timer
     clock_t begin,end;
@@ -214,8 +201,8 @@ int main()
     float total_gpu1=0,total_gpu2=0,total_gpu3=0,total_gpu4=0,total_gpu5=0;
 
     // GPU set threads & blocks
-    uint threads=N;
-    int sharedsize=threads;
+    uint threads=256;
+    int sharedsize=N;
     int blocknum=(N+threads-1)/threads;
 
 
@@ -223,6 +210,8 @@ int main()
 
     for(int tt=0; tt<TEST_TIMES; tt++)
     {
+
+    //printf("Test %d:  \n",tt);
 
     // Random fill in matrix & vector
     for (int i = 0; i < N; i++)
@@ -247,7 +236,10 @@ int main()
             *(d_a+i*N+k)=0;
             if(a_row[k])
             {
-                *(d_a+i*N+k)=rand()%10;
+                rand_temp=rand()%10;
+                while(rand_temp==0)
+                rand_temp=rand()%10;
+                *(d_a+i*N+k)=rand_temp;
                 //printf("row:%d val:%f \n",*(sma_a_col+pos),*(sma_a_val+pos));
                 pos++;
             }
@@ -255,7 +247,7 @@ int main()
         
     }
 
-    for (int i = 0; i < N*TEST_TIMES; i++)
+    for (int i = 0; i < N; i++)
         *(d_b+i) = rand() % 10;
 
     // * Recording csr decoding time *
@@ -285,7 +277,7 @@ int main()
     // Cpu Mul reference
     begin=clock();
 
-    for(int i=0;i<1;i++)
+    for(int jj=0; jj<TEST_REPEAT; jj++)
         mul_cpu(d_a,d_b,d_c);
 
     end=clock();
@@ -311,7 +303,8 @@ int main()
         {
             *(d_row+j*N+i)=*(sma_a_col+i*S+j);
             *(d_val+j*N+i)=*(sma_a_val+i*S+j);
-        }
+            //printf("[%d,%d]d_row=%d,d_val=%f\n",i,j,*(d_row+j*N+i),*(d_val+j*N+i));
+        }   
     end=clock();
     timer=(double)(end-begin)/CLOCKS_PER_SEC;
     total_trans+=timer;
@@ -322,7 +315,9 @@ int main()
     // 1.Normal Matrix mul kernel
     cudaEventRecord(start,0);
 
-    mul_kernel<<<blocknum, threads>>>(N,N,N,d_a,d_b,c1);
+    for(int jj=0; jj<TEST_REPEAT; jj++)
+        mul_kernel<<<blocknum, threads>>>(N,N,N,d_a,d_b,c1);
+
     cudaDeviceSynchronize();
 
     cudaEventRecord(stop,0); 
@@ -331,13 +326,14 @@ int main()
     cudaEventElapsedTime(&gpu_timer,start,stop);
 
     total_gpu1+=gpu_timer;
-    //printf("The total gpu run time is %f ms.\n",costtime2);
+    //printf("The total gpu run time is %f ms.\n",gpu_timer);
 
 
     // 2.Matrix mul using shared memory kernel
     cudaEventRecord(start,0);
 
-    mul_kernel_shared<<<blocknum, threads>>>(N,N,N,d_a,d_b,c2,sharedsize);
+    for(int jj=0; jj<TEST_REPEAT; jj++)
+        mul_kernel_shared<<<blocknum, threads>>>(N,N,N,d_a,d_b,c2,sharedsize);
     cudaDeviceSynchronize();
 
     cudaEventRecord(stop,0); 
@@ -346,14 +342,16 @@ int main()
     cudaEventElapsedTime(&gpu_timer,start,stop);
 
     total_gpu2+=gpu_timer;
-    //printf("The total gpu (use shared memory) run time is %f ms.\n",costtime);
+    //printf("The total gpu (use shared memory) run time is %f ms.\n",gpu_timer);
 
 
     // 3.Matrix mul using shared memory and csr kernel
 
     cudaEventRecord(start,0);
 
-    mul_kernel_shared_csr<<<blocknum, threads>>>(N,N,N,d_row,d_val,d_b,c3,sharedsize);
+    for(int jj=0; jj<TEST_REPEAT; jj++)
+        mul_kernel_shared_csr<<<blocknum, threads>>>(N,N,N,d_row,d_val,d_b,c3,sharedsize);
+
     cudaDeviceSynchronize();
 
     cudaEventRecord(stop,0); 
@@ -361,12 +359,14 @@ int main()
     cudaEventSynchronize(stop); 
     cudaEventElapsedTime(&gpu_timer,start,stop);
     total_gpu3+=gpu_timer;
-    //printf("The total gpu (using csr and shared memory) run time is %f ms.\n",costtime3);
+    //printf("The total gpu (using csr and shared memory) run time is %f ms.\n",gpu_timer);
 
     // 4.Use register
     cudaEventRecord(start,0);
 
-    mul_kernel_shared_csr_reg<<<blocknum, threads>>>(N,N,N,d_row,d_val,d_b,c4,sharedsize);
+    for(int jj=0; jj<TEST_REPEAT; jj++)
+        mul_kernel_shared_csr_reg<<<blocknum, threads>>>(N,N,N,d_row,d_val,d_b,c4,sharedsize);
+
     cudaDeviceSynchronize();
 
     cudaEventRecord(stop,0); 
@@ -374,7 +374,7 @@ int main()
     cudaEventSynchronize(stop); 
     cudaEventElapsedTime(&gpu_timer,start,stop);
     total_gpu4+=gpu_timer;
-    //printf("The total gpu (using csr by register and shared memory) run time is %f ms.\n",costtime5);
+    //printf("The total gpu (using csr by register and shared memory) run time is %f ms.\n",gpu_timer);
 
     // 5.Matrix using cublas function call
     float alpha = 1;
@@ -387,7 +387,8 @@ int main()
     cudaEventRecord(start,0);
 
     // matrix cublas call
-    cublasSgemm(handle,
+    for(int jj=0; jj<TEST_REPEAT; jj++)
+        cublasSgemm(handle,
         CUBLAS_OP_T,  
         CUBLAS_OP_N,   
         M,                    // row of B
@@ -408,7 +409,7 @@ int main()
     cudaEventSynchronize(stop); 
     cudaEventElapsedTime(&gpu_timer,start,stop);
     total_gpu5+=gpu_timer;
-    //printf("The total gpu (using cublas) run time is %f ms.\n",costtime4);
+    //printf("The total gpu (using cublas) run time is %f ms.\n",gpu_timer);
 
 
     // Correct test Part
@@ -439,7 +440,7 @@ int main()
     // test diff
     /*for(int i=0;i<TEST_TIMES*N;i++)
     {
-        printf("c=%f\to1=%f\to2=%f\to3=%f\to4=%f\to5=%f\n",*(ref+i),*(h_c1+i),*(h_c2+i),*(h_c3+i),*(h_c4+i),*(h_c5+i));
+        printf("c=%f\to1=%f\to2=%f\to3=%f\to4=%f\to5=%f\n",*(d_c+i),*(c1+i),*(c2+i),*(c3+i),*(c4+i),*(c5+i));
     }*/
 
 
